@@ -1,0 +1,181 @@
+#!/bin/bash -l
+#SBATCH --nodes=1 --ntasks-per-node=12
+cd $SLURM_SUBMIT_DIR
+
+date
+
+# STEP 1: Create a  manifest file that links the sample names to the fastq files
+# The manifest file is a csv file where the first column is the "sample-id", the second column is the "absolute-filepath" to the fastq.gz file, the third column is the "direction" of the reads (forward or reverse).
+# Make sure the sample id ends at “L001” not R1_001.fastq.gz. The reverse and forward sample ids need to be the same so they can’t have “R1” or “R2” in the id name.
+cd /home/colleen_ahern/qiime2-BASFdata/BASFFQfiles2
+echo "sample-id,absolute-filepath,direction" > manifest.csv 
+for i in *R1* ; do echo "${i/_R1.fastq.gz},$PWD/$i,forward"; done >> manifest.csv 
+for i in *R2* ; do echo "${i/_R2.fastq.gz},$PWD/$i,reverse"; done >> manifest.csv
+
+# STEP 2: Load qiime2
+conda activate qiime2-2023.2
+
+# STEP 3: Import the fastq files in Qiime2 (stored in Qiime2 as a .qza file)
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path manifest.csv \
+  --output-path paired-end-demux.qza \
+  --input-format PairedEndFastqManifestPhred33
+
+# STEP 4: Visualize the .qzv file on qiime tools view: https://view.qiime2.org/ (.qzv file is the visualization format in Qiime2)
+qiime demux summarize \
+  --i-data paired-end-demux.qza \
+  --o-visualization paired-end-demux.qzv
+
+# STEP 5: Inspect read quality: A combination of FASTQC and MultiQC is used to check if the reads are of reasonable quality and to how your reads should be trimmed in downstream steps. 
+# “multiqc_report.html” is found in the fastqc output directory -- view this report in the web browser
+mkdir fastqc
+fastqc -t 4 BASFFQfiles3/*.fastq.gz -o fastqc
+cd fastqc
+multiqc .
+cd ..
+
+# STEP 6: Use cut adapt to remove primers
+qiime cutadapt trim-paired --i-demultiplexed-sequences BASFFQfiles2/paired-end-demux.qza --p-cores 4 --p-front-f CCTACGGGNGGCWGCAG --p-front-r GACTACHVGGGTATCTAATCC --p-discard-untrimmed --p-no-indels --o-trimmed-sequences BASFFQfiles2/trimmed_paired-end.qza
+qiime demux summarize --i-data BASFFQfiles2/trimmed_paired-end.qza --o-visualization BASFFQfiles2/trimmed_paired-end.qzv
+cd BASFFQfiles2
+mkdir Analysis
+
+# STEP 7: trim reads to improve read quality
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs trimmed_paired-end.qza \
+  --p-trim-left-f 17 \
+  --p-trim-left-r 21 \
+  --p-trunc-len-f 275 \
+  --p-trunc-len-r 235 \
+  --p-n-threads 40 \
+  --o-table Analysis/16S-table.qza \
+  --o-representative-sequences Analysis/16S-rep-seqs.qza \
+  --o-denoising-stats Analysis/16S-denoising-stats.qza \
+  --verbose
+
+# STEP 8: Make summary files and visualize the outputs of DADA2. This requires a metadata file with the treatment info (the first column needs to be "sample-id" and the other columns are conditions etc.)
+qiime metadata tabulate \
+  --m-input-file Analysis3_3/16S-denoising-stats.qza \
+  --o-visualization Analysis3_3/16S-denoising-stats.qzv
+
+qiime feature-table summarize \
+  --i-table Analysis3_3/16S-table.qza \
+  --o-visualization Analysis3_3/16S-table.qzv \
+  --m-sample-metadata-file metadata2.txt
+
+qiime feature-table tabulate-seqs \
+  --i-data Analysis3_3/16S-rep-seqs.qza \
+  --o-visualization Analysis3_3/16S-rep-seqs.qzv
+
+# STEP 9: Download SILVA database
+qiime rescript get-silva-data --p-version '138' --p-target 'SSURef_NR99' --p-include-species-labels --o-silva-sequences silva-138-ssu-nr99-seqs.qza --o-silva-taxonomy silva-138-ssu-nr99-tax.qza
+
+# STEP 10: Assign taxonomy to the SVs: Download pretrained classifier or train your own
+cd /home/colleen_ahern/qiime2-BASFdata
+
+qiime feature-classifier classify-sklearn \
+  --i-classifier silva-138-99-nb-classifier.qza  \
+  --i-reads BASFFQfiles2/Analysis/16S-rep-seqs.qza \
+  --o-classification BASFFQfiles2/Analysis/16S-rep-seqs-taxonomy.qza
+
+# STEP 11: Visualize taxonomy output
+qiime metadata tabulate \
+  --m-input-file 16S-rep-seqs-taxonomy.qza \
+  --o-visualization 16S-rep-seqs-taxonomy.qzv
+
+# STEP 12: Remove SVs in the table that are Chloroplast or Mitochondria (not bacterial or archaeal taxa)
+cd /home/colleen_ahern/qiime2-BASFdata/BASFFQfiles2/Analysis
+qiime taxa filter-table \
+  --i-table 16S-table.qza \
+  --i-taxonomy 16S-rep-seqs-taxonomy.qza \
+  --p-exclude mitochondria,chloroplast \
+  --o-filtered-table 16S-table-noplant.qza
+
+# STEP 13: Rarefy
+qiime feature-table rarefy \
+  --i-table 16S-table-noplant.qza \
+  --p-sampling-depth 10000 \
+  --o-rarefied-table 16S-table-noplant-rarefied-10000.qza
+
+# STEP 14: Remove SVs that are present only in 1 sample
+qiime feature-table filter-features \
+  --i-table 16S-table-noplant-rarefied-10000.qza \
+  --p-min-samples 2 \
+  --o-filtered-table 16S-table-noplant-rarefied-10000_filtered.qza
+
+# STEP 15: Filter the the rep-seq.qza to keep only SVs that are present in the final SV table (remove SVs that were Chloroplast, Mitochondria or found in only one sample…)**
+qiime feature-table filter-seqs \
+  --i-data 16S-rep-seqs.qza \
+  --i-table 16S-table-noplant-rarefied-10000_filtered.qza \
+  --o-filtered-data 16S-rep-seqs-filtered.qza
+
+# STEP 16: Summary after cleaning steps**
+cd /home/colleen_ahern/qiime2-BASFdata/BASFFQfiles2
+
+qiime feature-table summarize \
+  --i-table Analysis/16S-table-noplant-rarefied-10000_filtered.qza \
+  --o-visualization Analysis/16S-table-noplant-rarefied-10000_filtered.qzv \
+  --m-sample-metadata-file metadata.txt
+
+
+# STEP 17: Export SV table (.biom file) and representative sequences (fasta file) for analyses in R 
+qiime tools export \
+  --input-path 16S-rep-seqs.qza \
+  --output-path Dada2-output
+
+qiime tools export \
+  --input-path 16S-table-noplant-rarefied-10000_filtered.qza \
+  --output-path Dada2-output
+
+# STEP 18: Make and export phylogenetic tree
+qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences 16S-rep-seqs-filtered.qza \
+  --o-alignment aligned-16S-rep-seqs-filtered.qza \
+  --o-masked-alignment masked-aligned-rep-seqs-filtered.qza \
+  --o-tree unrooted-16S-tree-filteredSVs.qza \
+  --o-rooted-tree rooted-16S-tree-filteredSVs.qza
+
+qiime tools export \
+  --input-path unrooted-16S-tree-filteredSVs.qza \
+  --output-path exported-tree-16S
+
+qiime tools export \
+  --input-path  rooted-16S-tree-filteredSVs.qza \
+  --output-path exported-tree-16S
+
+# STEP 19: Make relative abundance bar plots (grouped and ungrouped)
+cd /home/colleen_ahern/qiime2-BASFdata/BASFFQfiles2
+
+# Ungrouped
+qiime taxa barplot --i-table Analysis/16S-table-noplant-rarefied-10000_filtered.qza --i-taxonomy Analysis/16S-rep-seqs-taxonomy.qza --m-metadata-file metadata.txt --o-visualization Analysis/16S-taxa_barplot.qzv
+
+# Grouping biological replicates
+qiime feature-table group \
+   --i-table Analysis/16S-table-noplant-rarefied-10000_filtered.qza \
+   --p-axis 'sample' \
+   --m-metadata-file metadata2.txt \
+   --m-metadata-column "Group" \
+   --p-mode 'mean-ceiling' \
+   --o-grouped-table Analysis/16S-table-noplant-rarefied-10000_filtered_grouped.qza
+
+qiime taxa barplot \
+   --i-table Analysis/16S-table-noplant-rarefied-10000_filtered_grouped.qza \
+   --i-taxonomy Analysis/16S-rep-seqs-taxonomy.qza \
+   --m-metadata-file metadata_grouped.txt \
+   --o-visualization Analysis/16S-taxa-barplot_grouped.qzv
+
+# STEP 20: Calculate diversity metrics and generate ordination plots 
+qiime diversity core-metrics-phylogenetic --i-table Analysis/16S-table-noplant-rarefied-10000_filtered.qza  --i-phylogeny Analysis/rooted-16S-tree-filteredSVs.qza --p-sampling-depth 9195 --m-metadata-file metadata.txt --output-dir Analysis/diversity
+
+qiime diversity alpha-group-significance --i-alpha-diversity Analysis/diversity/shannon_vector.qza --m-metadata-file metadata.txt --o-visualization Analysis/diversity/shannon_compare_groups.qzv
+
+# STEP 21: Analyze sample composition in the context of categorical metadata using PERMANOVA
+qiime diversity beta-group-significance --i-distance-matrix Analysis/diversity/unweighted_unifrac_distance_matrix.qza --m-metadata-file metadata2.txt --m-metadata-column Group --o-visualization Analysis/diversity/unweighted-unifrac-Group-Name-significance.qzv --p-pairwise
+
+qiime diversity beta-group-significance --i-distance-matrix Analysis/diversity/unweighted_unifrac_distance_matrix.qza --m-metadata-file metadata2.txt --m-metadata-column Substrate --o-visualization Analysis/diversity/unweighted-unifrac-Substrate-significance.qzv --p-pairwise
+
+qiime diversity beta-group-significance --i-distance-matrix Analysis/diversity/weighted_unifrac_distance_matrix.qza --m-metadata-file metadata2.txt --m-metadata-column Group --o-visualization Analysis/diversity/weighted-unifrac-Group-Name-significance.qzv --p-pairwise
+
+date
+
